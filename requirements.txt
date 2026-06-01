@@ -1,4 +1,7 @@
 torch
 transformers
+huggingface-hub
 Pillow
 pyserial
+opencv-python
+Flask
