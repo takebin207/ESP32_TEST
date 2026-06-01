@@ -435,7 +435,7 @@ HTML_PAGE = r"""
                 <input id="portInput" placeholder="COM5">
               </label>
               <label>Min confidence
-                <input id="confidenceInput" type="number" min="0" max="1" step="0.05" value="0.55">
+                <input id="confidenceInput" type="number" min="0" max="1" step="0.05" value="0.35">
               </label>
               <label>Detect interval (s)
                 <input id="intervalInput" type="number" min="0.5" step="0.5" value="2">
@@ -596,8 +596,8 @@ class SmartBinRuntime:
         self.baudrate = 115200
         self.interval = 2.0
         self.cooldown = 3.0
-        self.min_confidence = 0.55
-        self.reset_after = 0.0
+        self.min_confidence = 0.35
+        self.reset_after = 1.0
         self.last_detection_at = 0.0
         self.last_counted_at = 0.0
         self.last_sent_at = 0.0
@@ -609,12 +609,14 @@ class SmartBinRuntime:
         self.stats = {"total": 0, "organic": 0, "inorganic": 0}
         self.history: deque[dict[str, Any]] = deque(maxlen=20)
         self.frame_jpeg: bytes | None = None
+        self.latest_frame: Any = None
         self.stop_event = threading.Event()
 
     def start(self) -> None:
         logging.info("Starting SmartBin runtime")
         threading.Thread(target=self._load_model, daemon=True).start()
         threading.Thread(target=self._camera_loop, daemon=True).start()
+        threading.Thread(target=self._detection_loop, daemon=True).start()
 
     def _load_model(self) -> None:
         logging.info("Loading model")
@@ -679,7 +681,8 @@ class SmartBinRuntime:
                 continue
 
             self._update_frame(frame)
-            self._maybe_detect(frame)
+            with self.lock:
+                self.latest_frame = frame.copy()
             time.sleep(0.03)
 
         if camera is not None:
@@ -706,6 +709,16 @@ class SmartBinRuntime:
         if ok:
             with self.lock:
                 self.frame_jpeg = encoded.tobytes()
+
+    def _detection_loop(self) -> None:
+        while not self.stop_event.is_set():
+            with self.lock:
+                frame = None if self.latest_frame is None else self.latest_frame.copy()
+
+            if frame is not None:
+                self._maybe_detect(frame)
+
+            time.sleep(0.05)
 
     def _maybe_detect(self, frame: Any) -> None:
         with self.lock:
@@ -751,6 +764,7 @@ class SmartBinRuntime:
         command = result["command"]
         sent = False
         error = ""
+        responses = []
 
         with self.lock:
             port = self.serial_port
@@ -762,7 +776,14 @@ class SmartBinRuntime:
             try:
                 logging.info("Sending serial command %s to %s", command, port)
                 with self.serial_lock:
-                    responses = send_command_to_esp32(port, command, baudrate, reset_after)
+                    responses = send_command_to_esp32(
+                        port,
+                        command,
+                        baudrate,
+                        reset_after,
+                        response_wait=0.15,
+                        boot_wait=0,
+                    )
                 sent = True
                 logging.info("ESP32 response: %s", " | ".join(responses) if responses else "no response")
             except Exception as exc:
@@ -806,7 +827,14 @@ class SmartBinRuntime:
 
         logging.info("Sending manual command %s to %s", command, port)
         with self.serial_lock:
-            responses = send_command_to_esp32(port, command, baudrate, reset_after)
+            responses = send_command_to_esp32(
+                port,
+                command,
+                baudrate,
+                reset_after,
+                response_wait=0.6,
+                boot_wait=0,
+            )
         logging.info("ESP32 response: %s", " | ".join(responses) if responses else "no response")
         with self.lock:
             self.last_servo_command = command

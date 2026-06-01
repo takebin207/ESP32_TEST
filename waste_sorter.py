@@ -33,22 +33,35 @@ MODEL_NAME = LOCAL_MODEL_DIR
 SERVO_ORGANIC_COMMAND = "ORGANIC"
 SERVO_INORGANIC_COMMAND = "INORGANIC"
 
+ORGANIC_LABELS = {"biological"}
 INORGANIC_RECYCLABLE = {"cardboard", "paper"}
-INORGANIC_MATERIALS = {"glass", "metal", "plastic"}
+INORGANIC_MATERIALS = {
+    "battery",
+    "brown-glass",
+    "clothes",
+    "glass",
+    "green-glass",
+    "metal",
+    "plastic",
+    "shoes",
+    "white-glass",
+}
 RESIDUAL_TRASH = {"trash"}
 
 
 def map_to_waste_group(fine_grained_label: str) -> tuple[str, str]:
     label = fine_grained_label.lower().strip()
 
+    if label in ORGANIC_LABELS:
+        return SERVO_ORGANIC_COMMAND, "HUU CO - rac de phan huy sinh hoc"
     if label in INORGANIC_RECYCLABLE:
         return SERVO_INORGANIC_COMMAND, "VO CO - giay / bia cung tai che"
     if label in INORGANIC_MATERIALS:
-        return SERVO_INORGANIC_COMMAND, "VO CO - chai lo / kim loai / nhua"
+        return SERVO_INORGANIC_COMMAND, "VO CO - vat lieu kho phan huy"
     if label in RESIDUAL_TRASH:
         return SERVO_INORGANIC_COMMAND, "VO CO - rac sinh hoat con lai"
 
-    return SERVO_ORGANIC_COMMAND, "HUU CO - rac de phan huy sinh hoc"
+    return SERVO_INORGANIC_COMMAND, "VO CO - chua ro nhom chi tiet"
 
 
 def local_model_ready() -> bool:
@@ -167,26 +180,34 @@ def auto_detect_port() -> str | None:
     return None
 
 
-def send_command_to_esp32(port: str, command: str, baudrate: int, reset_after: float) -> list[str]:
+def send_command_to_esp32(
+    port: str,
+    command: str,
+    baudrate: int,
+    reset_after: float,
+    response_wait: float = 1.0,
+    boot_wait: float = 2.0,
+) -> list[str]:
     if serial is None:
         raise RuntimeError("Chua cai pyserial. Cai bang lenh: python -m pip install -r requirements.txt")
 
     print(f"Mo cong serial {port} @ {baudrate} baud...")
     responses = []
     with serial.Serial(port, baudrate, timeout=2) as connection:
-        time.sleep(2)
+        if boot_wait > 0:
+            time.sleep(boot_wait)
 
         connection.write(f"{command}\n".encode("utf-8"))
         connection.flush()
         print(f"Da gui lenh: {command}")
-        responses.extend(read_serial_lines(connection, 1.0))
+        responses.extend(read_serial_lines(connection, response_wait))
 
         if reset_after > 0:
             time.sleep(reset_after)
             connection.write(b"CENTER\n")
             connection.flush()
             print("Da dua servo ve CENTER")
-            responses.extend(read_serial_lines(connection, 1.0))
+            responses.extend(read_serial_lines(connection, response_wait))
 
     return responses
 
@@ -286,7 +307,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--live", action="store_true", help="Nhan dien lien tuc tu camera laptop.")
     parser.add_argument("--interval", type=float, default=2.0, help="So giay giua moi lan nhan dien live.")
     parser.add_argument("--cooldown", type=float, default=3.0, help="So giay toi thieu giua moi lan gui lenh servo.")
-    parser.add_argument("--min-confidence", type=float, default=0.55, help="Nguong tin cay de gui lenh servo live.")
+    parser.add_argument("--min-confidence", type=float, default=0.35, help="Nguong tin cay de gui lenh servo live.")
     parser.add_argument("--port", default=None, help="Cong serial ESP32, vi du COM5.")
     parser.add_argument("--baudrate", type=int, default=115200, help="Baudrate serial.")
     parser.add_argument("--no-serial", action="store_true", help="Chi chay model, khong gui lenh den ESP32.")
@@ -298,8 +319,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reset-after",
         type=float,
-        default=0,
-        help="So giay cho truoc khi gui CENTER. Mac dinh 0 la giu nguyen vi tri.",
+        default=1.0,
+        help="So giay cho truoc khi gui CENTER. Dat 0 de giu nguyen vi tri.",
     )
     return parser
 
