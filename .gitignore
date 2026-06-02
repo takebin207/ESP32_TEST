@@ -9,3 +9,4 @@ __pycache__/
 .mypy_cache/
 logs/
 models/
+.tmp_waste_classifier_repo/

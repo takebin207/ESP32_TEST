@@ -15,8 +15,8 @@ from waste_sorter import (
     SERVO_ORGANIC_COMMAND,
     auto_detect_port,
     cv2,
-    load_model,
-    predict_image,
+    load_selected_model,
+    predict_with_backend,
     send_command_to_esp32,
 )
 
@@ -589,6 +589,7 @@ class SmartBinRuntime:
         self.serial_lock = threading.Lock()
         self.processor: Any = None
         self.model: Any = None
+        self.model_backend = "transformers"
         self.model_ready = False
         self.model_loading = False
         self.camera_index = 0
@@ -631,8 +632,9 @@ class SmartBinRuntime:
             self.error = ""
 
         try:
-            processor, model = load_model()
+            backend, processor, model = load_selected_model(self.model_backend)
             with self.lock:
+                self.model_backend = backend
                 self.processor = processor
                 self.model = model
                 self.model_ready = True
@@ -734,6 +736,7 @@ class SmartBinRuntime:
         with self.lock:
             ready = self.model_ready and self.detection_enabled
             due = time.monotonic() - self.last_detection_at >= self.interval
+            backend = self.model_backend
             processor = self.processor
             model = self.model
 
@@ -745,7 +748,7 @@ class SmartBinRuntime:
 
         try:
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            result = predict_image(Image.fromarray(rgb_frame), processor, model)
+            result = predict_with_backend(Image.fromarray(rgb_frame), backend, processor, model)
             logging.info(
                 "Detection label=%s command=%s confidence=%.3f",
                 result["original_label"],
@@ -888,6 +891,7 @@ class SmartBinRuntime:
             return {
                 "model_ready": self.model_ready,
                 "model_loading": self.model_loading,
+                "model_backend": self.model_backend,
                 "camera_active": self.camera_active,
                 "camera_index": self.camera_index,
                 "detection_enabled": self.detection_enabled,
@@ -989,6 +993,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--camera-index", type=int, default=0)
     parser.add_argument("--serial-port", default=None)
     parser.add_argument("--no-serial", action="store_true")
+    parser.add_argument(
+        "--model-backend",
+        choices=["transformers", "keras", "fathima"],
+        default="transformers",
+    )
     return parser
 
 
@@ -1003,6 +1012,7 @@ def main() -> None:
         args.serial_port,
         not args.no_serial,
     )
+    runtime.model_backend = args.model_backend
     runtime.camera_index = args.camera_index
     runtime.serial_enabled = not args.no_serial
     runtime.serial_port = args.serial_port or runtime.serial_port

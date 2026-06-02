@@ -5,3 +5,4 @@ Pillow
 pyserial
 opencv-python
 Flask
+tensorflow

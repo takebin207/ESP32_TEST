@@ -29,9 +29,30 @@ except ImportError:
 
 REMOTE_MODEL_NAME = "watersplash/waste-classification"
 LOCAL_MODEL_DIR = os.path.join(os.path.dirname(__file__), "models", "waste-classification")
+KERAS_REMOTE_MODEL_NAME = "03Komalpreet/WASTE_CLASSIFICATION"
+KERAS_LOCAL_MODEL_DIR = os.path.join(os.path.dirname(__file__), "models", "komalpreet-waste-classification")
+KERAS_MODEL_FILE = os.path.join(KERAS_LOCAL_MODEL_DIR, "waste_classification_model.h5")
+FATHIMA_REMOTE_MODEL_NAME = "fathima-ai/waste_classifier2"
+FATHIMA_LOCAL_MODEL_DIR = os.path.join(os.path.dirname(__file__), "models", "fathima-waste-classifier")
+FATHIMA_MODEL_FILE = os.path.join(FATHIMA_LOCAL_MODEL_DIR, "waste_classifier_model.h5")
 MODEL_NAME = LOCAL_MODEL_DIR
 SERVO_ORGANIC_COMMAND = "ORGANIC"
 SERVO_INORGANIC_COMMAND = "INORGANIC"
+
+KERAS_LABELS = [
+    "battery",
+    "biological",
+    "brown-glass",
+    "cardboard",
+    "clothes",
+    "green-glass",
+    "metal",
+    "paper",
+    "plastic",
+    "shoes",
+    "trash",
+    "white-glass",
+]
 
 ORGANIC_LABELS = {"biological", "cardboard", "paper"}
 HAZARDOUS_LABELS = {"battery"}
@@ -133,6 +154,14 @@ def local_model_ready() -> bool:
     return has_config and has_processor and has_weights
 
 
+def keras_model_ready() -> bool:
+    return os.path.exists(KERAS_MODEL_FILE) and os.path.getsize(KERAS_MODEL_FILE) > 0
+
+
+def fathima_model_ready() -> bool:
+    return os.path.exists(FATHIMA_MODEL_FILE) and os.path.getsize(FATHIMA_MODEL_FILE) > 0
+
+
 def load_model() -> tuple[Any, Any]:
     if not local_model_ready():
         raise RuntimeError(
@@ -144,6 +173,55 @@ def load_model() -> tuple[Any, Any]:
     model = AutoModelForImageClassification.from_pretrained(LOCAL_MODEL_DIR, local_files_only=True)
     model.eval()
     return processor, model
+
+
+def load_keras_model() -> tuple[None, Any]:
+    if not keras_model_ready():
+        raise RuntimeError(
+            "Chua co model Keras local. Hay chay lenh: python download_keras_model.py"
+        )
+
+    try:
+        from tensorflow import keras
+    except ImportError as exc:
+        raise RuntimeError(
+            "Chua cai TensorFlow. Hay chay: python -m pip install tensorflow"
+        ) from exc
+
+    print(f"Dang tai Keras model local tu: {KERAS_MODEL_FILE}")
+    model = keras.models.load_model(KERAS_MODEL_FILE, compile=False)
+    return None, model
+
+
+def load_fathima_model() -> tuple[None, Any]:
+    if not fathima_model_ready():
+        raise RuntimeError(
+            "Chua co model Fathima local. Hay chay lenh: python download_fathima_model.py"
+        )
+
+    try:
+        from tensorflow import keras
+    except ImportError as exc:
+        raise RuntimeError(
+            "Chua cai TensorFlow. Hay chay: python -m pip install tensorflow"
+        ) from exc
+
+    print(f"Dang tai Fathima model local tu: {FATHIMA_MODEL_FILE}")
+    model = keras.models.load_model(FATHIMA_MODEL_FILE, compile=False)
+    return None, model
+
+
+def load_selected_model(model_backend: str) -> tuple[str, Any, Any]:
+    if model_backend == "fathima":
+        processor, model = load_fathima_model()
+        return "fathima", processor, model
+
+    if model_backend == "keras":
+        processor, model = load_keras_model()
+        return "keras", processor, model
+
+    processor, model = load_model()
+    return "transformers", processor, model
 
 
 def load_image(image_path: str) -> Image.Image:
@@ -211,13 +289,108 @@ def predict_image(image: Image.Image, processor: Any, model: Any) -> dict:
     }
 
 
-def predict_waste_from_file(image_path: str, processor: Any, model: Any) -> dict:
-    return predict_image(load_image(image_path), processor, model)
+def predict_keras_image(image: Image.Image, model: Any) -> dict:
+    import numpy as np
+
+    input_shape = model.input_shape
+    if isinstance(input_shape, list):
+        input_shape = input_shape[0]
+
+    height = input_shape[1] or 224
+    width = input_shape[2] or 224
+
+    resized = image.convert("RGB").resize((width, height))
+    array = np.asarray(resized, dtype="float32") / 255.0
+    batch = np.expand_dims(array, axis=0)
+
+    outputs = model.predict(batch, verbose=0)
+    probabilities = outputs[0]
+
+    probability_map = {
+        KERAS_LABELS[idx]: float(probabilities[idx])
+        for idx in range(min(len(KERAS_LABELS), len(probabilities)))
+    }
+    predicted_idx = max(range(len(probability_map)), key=lambda idx: list(probability_map.values())[idx])
+    original_label = list(probability_map.keys())[predicted_idx]
+    original_confidence = probability_map[original_label]
+    command, final_category, group, confidence_score, group_scores = classify_group(probability_map)
+
+    return {
+        "original_label": original_label,
+        "original_confidence": original_confidence,
+        "confidence": confidence_score,
+        "command": command,
+        "group": group,
+        "final_category": final_category,
+        "group_scores": group_scores,
+        "probabilities": probability_map,
+    }
+
+
+def predict_fathima_image(image: Image.Image, model: Any) -> dict:
+    import numpy as np
+
+    resized = image.convert("RGB").resize((150, 150))
+    array = np.asarray(resized, dtype="float32") / 255.0
+    batch = np.expand_dims(array, axis=0)
+
+    output = model.predict(batch, verbose=0)[0]
+    recyclable_score = float(output[0])
+    organic_score = 1.0 - recyclable_score
+    probability_map = {
+        "organic": organic_score,
+        "recyclable": recyclable_score,
+    }
+
+    if organic_score >= recyclable_score:
+        original_label = "organic"
+        original_confidence = organic_score
+        command = SERVO_ORGANIC_COMMAND
+        group = "organic"
+        final_category = "HUU CO - model Fathima phat hien organic"
+    else:
+        original_label = "recyclable"
+        original_confidence = recyclable_score
+        command = SERVO_INORGANIC_COMMAND
+        group = "inorganic"
+        final_category = "VO CO - model Fathima phat hien recyclable"
+
+    group_scores = {
+        "organic": organic_score,
+        "inorganic": recyclable_score,
+        "hazardous": 0.0,
+    }
+
+    return {
+        "original_label": original_label,
+        "original_confidence": original_confidence,
+        "confidence": original_confidence,
+        "command": command,
+        "group": group,
+        "final_category": final_category,
+        "group_scores": group_scores,
+        "probabilities": probability_map,
+    }
+
+
+def predict_with_backend(image: Image.Image, backend: str, processor: Any, model: Any) -> dict:
+    if backend == "fathima":
+        return predict_fathima_image(image, model)
+
+    if backend == "keras":
+        return predict_keras_image(image, model)
+
+    return predict_image(image, processor, model)
+
+
+def predict_waste_from_file(image_path: str, backend: str, processor: Any, model: Any) -> dict:
+    return predict_with_backend(load_image(image_path), backend, processor, model)
 
 
 def predict_waste_from_camera(
     camera_index: int,
     warmup_frames: int,
+    backend: str,
     processor: Any,
     model: Any,
     save_frame: str | None,
@@ -226,7 +399,7 @@ def predict_waste_from_camera(
     if save_frame:
         image.save(save_frame)
         print(f"Da luu frame camera vao: {save_frame}")
-    return predict_image(image, processor, model)
+    return predict_with_backend(image, backend, processor, model)
 
 
 def auto_detect_port() -> str | None:
@@ -320,7 +493,7 @@ def print_prediction(result: dict) -> None:
         print("\nKet qua: rac HUU CO -> servo quay 90 do sang trai.")
 
 
-def run_live_camera(args: argparse.Namespace, processor: Any, model: Any) -> None:
+def run_live_camera(args: argparse.Namespace, backend: str, processor: Any, model: Any) -> None:
     if cv2 is None:
         raise RuntimeError("Chua cai opencv-python. Cai bang lenh: python -m pip install -r requirements.txt")
 
@@ -341,7 +514,7 @@ def run_live_camera(args: argparse.Namespace, processor: Any, model: Any) -> Non
 
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             image = Image.fromarray(rgb_frame)
-            result = predict_image(image, processor, model)
+            result = predict_with_backend(image, backend, processor, model)
             print_prediction(result)
 
             now = time.monotonic()
@@ -369,6 +542,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-frames", type=int, default=10, help="So frame bo qua de camera on dinh.")
     parser.add_argument("--save-frame", default="camera_frame.jpg", help="Noi luu frame camera vua chup.")
     parser.add_argument("--live", action="store_true", help="Nhan dien lien tuc tu camera laptop.")
+    parser.add_argument(
+        "--model-backend",
+        choices=["transformers", "keras", "fathima"],
+        default="transformers",
+        help="Chon model: transformers hien tai, keras cua 03Komalpreet, hoac fathima binary organic/recyclable.",
+    )
     parser.add_argument("--interval", type=float, default=2.0, help="So giay giua moi lan nhan dien live.")
     parser.add_argument("--cooldown", type=float, default=3.0, help="So giay toi thieu giua moi lan gui lenh servo.")
     parser.add_argument("--min-confidence", type=float, default=0.35, help="Nguong tin cay de gui lenh servo live.")
@@ -399,22 +578,23 @@ def main() -> int:
             send_command_to_esp32(port, args.test_command, args.baudrate, args.reset_after)
             return 0
 
-        processor, model = load_model()
+        backend, processor, model = load_selected_model(args.model_backend)
 
         if args.live:
-            run_live_camera(args, processor, model)
+            run_live_camera(args, backend, processor, model)
             return 0
 
         if args.camera:
             result = predict_waste_from_camera(
                 args.camera_index,
                 args.warmup_frames,
+                backend,
                 processor,
                 model,
                 args.save_frame,
             )
         else:
-            result = predict_waste_from_file(args.image, processor, model)
+            result = predict_waste_from_file(args.image, backend, processor, model)
 
         print_prediction(result)
 
