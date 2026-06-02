@@ -33,8 +33,20 @@ MODEL_NAME = LOCAL_MODEL_DIR
 SERVO_ORGANIC_COMMAND = "ORGANIC"
 SERVO_INORGANIC_COMMAND = "INORGANIC"
 
-ORGANIC_LABELS = {"biological"}
-INORGANIC_RECYCLABLE = {"cardboard", "paper"}
+ORGANIC_LABELS = {"biological", "cardboard", "paper"}
+HAZARDOUS_LABELS = {"battery"}
+INORGANIC_RECYCLABLE_LABELS = {
+    "brown-glass",
+    "green-glass",
+    "metal",
+    "plastic",
+    "white-glass",
+}
+INORGANIC_RESIDUAL_LABELS = {
+    "clothes",
+    "shoes",
+    "trash",
+}
 INORGANIC_MATERIALS = {
     "battery",
     "brown-glass",
@@ -53,15 +65,62 @@ def map_to_waste_group(fine_grained_label: str) -> tuple[str, str]:
     label = fine_grained_label.lower().strip()
 
     if label in ORGANIC_LABELS:
+        if label in {"cardboard", "paper"}:
+            return SERVO_ORGANIC_COMMAND, "HUU CO - giay / bia co the phan huy"
         return SERVO_ORGANIC_COMMAND, "HUU CO - rac de phan huy sinh hoc"
-    if label in INORGANIC_RECYCLABLE:
-        return SERVO_INORGANIC_COMMAND, "VO CO - giay / bia cung tai che"
+    if label in HAZARDOUS_LABELS:
+        return SERVO_INORGANIC_COMMAND, "NGUY HAI - pin / rac can tach rieng"
+    if label in INORGANIC_RECYCLABLE_LABELS:
+        return SERVO_INORGANIC_COMMAND, "VO CO - tai che duoc"
     if label in INORGANIC_MATERIALS:
         return SERVO_INORGANIC_COMMAND, "VO CO - vat lieu kho phan huy"
     if label in RESIDUAL_TRASH:
         return SERVO_INORGANIC_COMMAND, "VO CO - rac sinh hoat con lai"
 
     return SERVO_INORGANIC_COMMAND, "VO CO - chua ro nhom chi tiet"
+
+
+def label_group(label: str) -> str:
+    normalized = label.lower().strip()
+    if normalized in ORGANIC_LABELS:
+        return "organic"
+    if normalized in HAZARDOUS_LABELS:
+        return "hazardous"
+    return "inorganic"
+
+
+def classify_group(probabilities: dict[str, float]) -> tuple[str, str, str, float, dict[str, float]]:
+    group_scores = {"organic": 0.0, "inorganic": 0.0, "hazardous": 0.0}
+
+    for label, score in probabilities.items():
+        group_scores[label_group(label)] += score
+
+    best_group = max(group_scores, key=group_scores.get)
+
+    if best_group == "organic":
+        return (
+            SERVO_ORGANIC_COMMAND,
+            "HUU CO - phu hop u phan / biogas",
+            best_group,
+            group_scores[best_group],
+            group_scores,
+        )
+    if best_group == "hazardous":
+        return (
+            SERVO_INORGANIC_COMMAND,
+            "NGUY HAI - can tach rieng, tam dua sang ben vo co",
+            best_group,
+            group_scores[best_group],
+            group_scores,
+        )
+
+    return (
+        SERVO_INORGANIC_COMMAND,
+        "VO CO - tai che / khong tai che tuy vat lieu",
+        best_group,
+        group_scores[best_group],
+        group_scores,
+    )
 
 
 def local_model_ready() -> bool:
@@ -135,16 +194,20 @@ def predict_image(image: Image.Image, processor: Any, model: Any) -> dict:
     predicted_class_idx = logits.argmax(-1).item()
 
     labels = model.config.id2label
+    probability_map = {labels[idx]: score.item() for idx, score in enumerate(probabilities)}
     original_label = labels[predicted_class_idx]
-    confidence_score = probabilities[predicted_class_idx].item()
-    command, final_category = map_to_waste_group(original_label)
+    original_confidence = probabilities[predicted_class_idx].item()
+    command, final_category, group, confidence_score, group_scores = classify_group(probability_map)
 
     return {
         "original_label": original_label,
+        "original_confidence": original_confidence,
         "confidence": confidence_score,
         "command": command,
+        "group": group,
         "final_category": final_category,
-        "probabilities": {labels[idx]: score.item() for idx, score in enumerate(probabilities)},
+        "group_scores": group_scores,
+        "probabilities": probability_map,
     }
 
 
@@ -193,7 +256,8 @@ def send_command_to_esp32(
 
     print(f"Mo cong serial {port} @ {baudrate} baud...")
     responses = []
-    with serial.Serial(port, baudrate, timeout=2) as connection:
+    serial_timeout = max(0.05, min(response_wait, 0.2))
+    with serial.Serial(port, baudrate, timeout=serial_timeout) as connection:
         if boot_wait > 0:
             time.sleep(boot_wait)
 

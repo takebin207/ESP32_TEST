@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <ESP32Servo.h>
+#include <ESP32PWM.h>
 
 namespace {
 Servo sorterServo;
@@ -19,6 +20,18 @@ void moveServoTo(int angle, const char *label) {
   Serial.printf("Servo -> %s (%d deg)\n", label, angle);
 }
 
+void sweepServo() {
+  Serial.println("Servo sweep test start");
+  moveServoTo(kRightAngle, "RIGHT");
+  delay(900);
+  moveServoTo(kCenterAngle, "CENTER");
+  delay(900);
+  moveServoTo(kLeftAngle, "LEFT");
+  delay(900);
+  moveServoTo(kCenterAngle, "CENTER");
+  Serial.println("Servo sweep test done");
+}
+
 void handleCommand(String command) {
   command.trim();
   command.toUpperCase();
@@ -33,6 +46,8 @@ void handleCommand(String command) {
     moveServoTo(kRightAngle, "INORGANIC / RIGHT");
   } else if (command == "CENTER" || command == "RESET") {
     moveServoTo(kCenterAngle, "CENTER");
+  } else if (command == "SWEEP" || command == "TEST") {
+    sweepServo();
   } else {
     Serial.printf("Unknown command: %s\n", command.c_str());
   }
@@ -42,12 +57,18 @@ void handleCommand(String command) {
 void setup() {
   Serial.begin(115200);
 
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+
   sorterServo.setPeriodHertz(50);
   sorterServo.attach(kServoPin, kServoMinPulseUs, kServoMaxPulseUs);
   moveServoTo(kCenterAngle, "CENTER");
 
   Serial.println("Waste sorter ready.");
-  Serial.println("Commands: ORGANIC, INORGANIC, CENTER");
+  Serial.printf("Servo signal pin: GPIO%d\n", kServoPin);
+  Serial.println("Commands: ORGANIC, INORGANIC, CENTER, SWEEP");
 }
 
 void loop() {

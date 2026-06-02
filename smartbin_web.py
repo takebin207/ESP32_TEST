@@ -411,6 +411,7 @@ HTML_PAGE = r"""
           <div class="metric"><span>Total sorted</span><strong id="totalCount">0</strong></div>
           <div class="metric"><span>Right bin: inorganic</span><strong id="rightCount">0</strong></div>
           <div class="metric"><span>Left bin: organic</span><strong id="leftCount">0</strong></div>
+          <div class="metric"><span>Hazardous warning</span><strong id="hazardCount">0</strong></div>
           <div class="metric"><span>Servo command</span><strong id="servoCommand">CENTER</strong></div>
         </div>
       </div>
@@ -462,6 +463,7 @@ HTML_PAGE = r"""
               <button class="btn warn" data-action="reset_stats">Reset stats</button>
               <button class="btn" data-action="test_inorganic">Test right</button>
               <button class="btn" data-action="test_organic">Test left</button>
+              <button class="btn steel" data-action="sweep">Sweep servo</button>
             </div>
           </div>
         </div>
@@ -543,6 +545,7 @@ HTML_PAGE = r"""
       setText("totalCount", status.stats.total);
       setText("rightCount", status.stats.inorganic);
       setText("leftCount", status.stats.organic);
+      setText("hazardCount", status.stats.hazardous || 0);
       setText("servoCommand", status.last_servo_command || "CENTER");
       setText("categoryText", result.final_category || "No result");
       setText("labelText", result.original_label ? `Model label: ${result.original_label}` : "Point trash at the camera");
@@ -604,9 +607,12 @@ class SmartBinRuntime:
         self.last_servo_command = "CENTER"
         self.last_serial_response = ""
         self.last_result: dict[str, Any] | None = None
+        self.pending_command = ""
+        self.pending_count = 0
+        self.stable_frames_required = 2
         self.updated_at = ""
         self.error = ""
-        self.stats = {"total": 0, "organic": 0, "inorganic": 0}
+        self.stats = {"total": 0, "organic": 0, "inorganic": 0, "hazardous": 0}
         self.history: deque[dict[str, Any]] = deque(maxlen=20)
         self.frame_jpeg: bytes | None = None
         self.latest_frame: Any = None
@@ -662,6 +668,10 @@ class SmartBinRuntime:
                     camera.release()
                 logging.info("Opening camera index %s", camera_index)
                 camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                camera.set(cv2.CAP_PROP_FPS, 30)
+                camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 open_index = camera_index
                 time.sleep(0.4)
 
@@ -705,7 +715,7 @@ class SmartBinRuntime:
             cv2.rectangle(preview, (16, 74), (420, 120), (20, 24, 22), -1)
             cv2.putText(preview, overlay, (28, 105), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (255, 255, 255), 2)
 
-        ok, encoded = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        ok, encoded = cv2.imencode(".jpg", preview, [int(cv2.IMWRITE_JPEG_QUALITY), 72])
         if ok:
             with self.lock:
                 self.frame_jpeg = encoded.tobytes()
@@ -743,10 +753,7 @@ class SmartBinRuntime:
                 result["confidence"],
             )
             now = time.monotonic()
-            should_count = (
-                result["confidence"] >= self.min_confidence
-                and now - self.last_counted_at >= self.cooldown
-            )
+            should_count = self._is_stable_detection(result, now)
 
             with self.lock:
                 self.last_result = result
@@ -759,6 +766,22 @@ class SmartBinRuntime:
             logging.exception("Detection failed")
             with self.lock:
                 self.error = f"Detection error: {exc}"
+
+    def _is_stable_detection(self, result: dict[str, Any], now: float) -> bool:
+        stable_key = result.get("group", result["command"])
+
+        with self.lock:
+            if stable_key == self.pending_command:
+                self.pending_count += 1
+            else:
+                self.pending_command = stable_key
+                self.pending_count = 1
+
+            confidence_ok = result["confidence"] >= self.min_confidence
+            stable_ok = self.pending_count >= self.stable_frames_required
+            cooldown_ok = now - self.last_counted_at >= self.cooldown
+
+        return confidence_ok and stable_ok and cooldown_ok
 
     def _record_event(self, result: dict[str, Any]) -> None:
         command = result["command"]
@@ -797,7 +820,10 @@ class SmartBinRuntime:
             self.last_serial_response = " | ".join(responses) if responses else self.last_serial_response
             self.stats["total"] += 1
 
-            if command == SERVO_INORGANIC_COMMAND:
+            if result.get("group") == "hazardous":
+                self.stats["hazardous"] += 1
+                self.stats["inorganic"] += 1
+            elif command == SERVO_INORGANIC_COMMAND:
                 self.stats["inorganic"] += 1
             else:
                 self.stats["organic"] += 1
@@ -853,7 +879,7 @@ class SmartBinRuntime:
 
     def reset_stats(self) -> None:
         with self.lock:
-            self.stats = {"total": 0, "organic": 0, "inorganic": 0}
+            self.stats = {"total": 0, "organic": 0, "inorganic": 0, "hazardous": 0}
             self.history.clear()
             self.last_counted_at = 0
 
@@ -940,6 +966,8 @@ def api_control() -> Response:
             runtime.reset_stats()
         elif action == "center":
             runtime.send_manual_command("CENTER")
+        elif action == "sweep":
+            runtime.send_manual_command("SWEEP")
         elif action == "test_inorganic":
             runtime.send_manual_command(SERVO_INORGANIC_COMMAND)
         elif action == "test_organic":
