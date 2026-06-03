@@ -5,7 +5,7 @@
 namespace {
 Servo sorterServo;
 
-constexpr int kServoPin = 4;
+constexpr int kServoPin = 40;
 constexpr int kServoMinPulseUs = 500;
 constexpr int kServoMaxPulseUs = 2400;
 

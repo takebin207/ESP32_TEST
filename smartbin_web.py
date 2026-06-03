@@ -432,6 +432,13 @@ HTML_PAGE = r"""
             </div>
 
             <div class="settings">
+              <label>Model backend
+                <select id="modelBackendInput">
+                  <option value="transformers">Transformers</option>
+                  <option value="keras">Keras</option>
+                  <option value="fathima">Fathima</option>
+                </select>
+              </label>
               <label>Serial port
                 <input id="portInput" placeholder="COM5">
               </label>
@@ -495,6 +502,7 @@ HTML_PAGE = r"""
 
     function settingsPayload() {
       return {
+        model_backend: $("modelBackendInput").value,
         port: $("portInput").value.trim(),
         min_confidence: Number($("confidenceInput").value),
         interval: Number($("intervalInput").value),
@@ -540,7 +548,8 @@ HTML_PAGE = r"""
       $("runDot").classList.toggle("on", status.detection_enabled);
       setText("runText", status.detection_enabled ? "AI running" : "AI stopped");
       setText("cameraText", `Camera index ${status.camera_index}`);
-      setText("modelText", status.model_ready ? "Model ready" : "Model loading");
+      const modelLabel = status.model_backend || "transformers";
+      setText("modelText", status.model_ready ? `${modelLabel} ready` : `${modelLabel} loading`);
       setText("updatedText", status.updated_at || "Waiting");
       setText("totalCount", status.stats.total);
       setText("rightCount", status.stats.inorganic);
@@ -557,6 +566,7 @@ HTML_PAGE = r"""
       setText("eventCount", `${status.history.length} events`);
 
       if (document.activeElement !== $("portInput")) $("portInput").value = status.serial_port || "";
+      if (document.activeElement !== $("modelBackendInput")) $("modelBackendInput").value = status.model_backend || "transformers";
       if (document.activeElement !== $("confidenceInput")) $("confidenceInput").value = status.min_confidence;
       if (document.activeElement !== $("intervalInput")) $("intervalInput").value = status.interval;
       if (document.activeElement !== $("cooldownInput")) $("cooldownInput").value = status.cooldown;
@@ -568,7 +578,7 @@ HTML_PAGE = r"""
       button.addEventListener("click", () => sendAction(button.dataset.action));
     });
 
-    ["portInput", "confidenceInput", "intervalInput", "cooldownInput"].forEach((id) => {
+    ["modelBackendInput", "portInput", "confidenceInput", "intervalInput", "cooldownInput"].forEach((id) => {
       $(id).addEventListener("change", async () => {
         await postJson("/api/settings", settingsPayload());
         await refresh();
@@ -584,6 +594,8 @@ HTML_PAGE = r"""
 
 
 class SmartBinRuntime:
+    MODEL_BACKENDS = {"transformers", "keras", "fathima"}
+
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.serial_lock = threading.Lock()
@@ -621,30 +633,52 @@ class SmartBinRuntime:
 
     def start(self) -> None:
         logging.info("Starting SmartBin runtime")
-        threading.Thread(target=self._load_model, daemon=True).start()
+        self._start_model_load()
         threading.Thread(target=self._camera_loop, daemon=True).start()
         threading.Thread(target=self._detection_loop, daemon=True).start()
 
+    def _start_model_load(self) -> None:
+        threading.Thread(target=self._load_model, daemon=True).start()
+
     def _load_model(self) -> None:
-        logging.info("Loading model")
         with self.lock:
+            backend_name = self.model_backend
             self.model_loading = True
+            self.model_ready = False
+            self.processor = None
+            self.model = None
+            self.last_result = None
+            self.pending_command = ""
+            self.pending_count = 0
             self.error = ""
 
+        logging.info("Loading model backend=%s", backend_name)
         try:
-            backend, processor, model = load_selected_model(self.model_backend)
+            backend, processor, model = load_selected_model(backend_name)
             with self.lock:
                 self.model_backend = backend
                 self.processor = processor
                 self.model = model
                 self.model_ready = True
                 self.model_loading = False
-            logging.info("Model loaded")
+            logging.info("Model loaded backend=%s", backend)
         except Exception as exc:
             logging.exception("Model failed to load")
             with self.lock:
                 self.error = str(exc)
                 self.model_loading = False
+
+    def set_model_backend(self, requested_backend: str) -> None:
+        backend = str(requested_backend or "").strip().lower()
+        if backend not in self.MODEL_BACKENDS:
+            raise RuntimeError(f"Unsupported model backend: {requested_backend}")
+
+        with self.lock:
+            if backend == self.model_backend and (self.model_ready or self.model_loading):
+                return
+            self.model_backend = backend
+
+        self._start_model_load()
 
     def _camera_loop(self) -> None:
         if cv2 is None:
@@ -871,6 +905,10 @@ class SmartBinRuntime:
             self.error = ""
 
     def update_settings(self, data: dict[str, Any]) -> None:
+        requested_backend = data.get("model_backend")
+        if requested_backend is not None:
+            self.set_model_backend(str(requested_backend))
+
         with self.lock:
             port = str(data.get("port") or "").strip()
             self.serial_port = port or auto_detect_port()
