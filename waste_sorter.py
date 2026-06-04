@@ -81,9 +81,32 @@ INORGANIC_MATERIALS = {
 }
 RESIDUAL_TRASH = {"trash"}
 
+LABEL_INFO = {
+    "battery": ("Pin / rac nguy hai", "NGUY HAI - pin can thu gom rieng, tam dua sang ben vo co"),
+    "biological": ("Rac sinh hoc / thuc pham", "HUU CO - rac de phan huy sinh hoc"),
+    "brown-glass": ("Thuy tinh nau", "VO CO - thuy tinh tai che duoc"),
+    "cardboard": ("Bia carton", "HUU CO - bia carton co the phan huy"),
+    "clothes": ("Quan ao / vai", "VO CO - vat lieu vai tong hop hoac can phan loai rieng"),
+    "green-glass": ("Thuy tinh xanh", "VO CO - thuy tinh tai che duoc"),
+    "metal": ("Kim loai", "VO CO - kim loai tai che duoc"),
+    "paper": ("Giay", "HUU CO - giay co the phan huy"),
+    "plastic": ("Nhua", "VO CO - nhua kho phan huy"),
+    "shoes": ("Giay dep", "VO CO - vat lieu tong hop kho phan huy"),
+    "trash": ("Rac sinh hoat con lai", "VO CO - rac con lai / khong tai che"),
+    "white-glass": ("Thuy tinh trang", "VO CO - thuy tinh tai che duoc"),
+    "organic": ("Rac huu co", "HUU CO - model nhi phan phat hien organic"),
+    "recyclable": ("Rac tai che", "VO CO - model nhi phan phat hien recyclable"),
+}
+
 
 def map_to_waste_group(fine_grained_label: str) -> tuple[str, str]:
     label = fine_grained_label.lower().strip()
+
+    if label in LABEL_INFO:
+        detail = LABEL_INFO[label][1]
+        if label in ORGANIC_LABELS or label == "organic":
+            return SERVO_ORGANIC_COMMAND, detail
+        return SERVO_INORGANIC_COMMAND, detail
 
     if label in ORGANIC_LABELS:
         if label in {"cardboard", "paper"}:
@@ -99,6 +122,11 @@ def map_to_waste_group(fine_grained_label: str) -> tuple[str, str]:
         return SERVO_INORGANIC_COMMAND, "VO CO - rac sinh hoat con lai"
 
     return SERVO_INORGANIC_COMMAND, "VO CO - chua ro nhom chi tiet"
+
+
+def display_label(label: str) -> str:
+    normalized = label.lower().strip()
+    return LABEL_INFO.get(normalized, (label, ""))[0]
 
 
 def label_group(label: str) -> str:
@@ -275,10 +303,14 @@ def predict_image(image: Image.Image, processor: Any, model: Any) -> dict:
     probability_map = {labels[idx]: score.item() for idx, score in enumerate(probabilities)}
     original_label = labels[predicted_class_idx]
     original_confidence = probabilities[predicted_class_idx].item()
-    command, final_category, group, confidence_score, group_scores = classify_group(probability_map)
+    _, _, _, _, group_scores = classify_group(probability_map)
+    command, final_category = map_to_waste_group(original_label)
+    group = label_group(original_label)
+    confidence_score = max(original_confidence, group_scores[group])
 
     return {
         "original_label": original_label,
+        "display_label": display_label(original_label),
         "original_confidence": original_confidence,
         "confidence": confidence_score,
         "command": command,
@@ -313,10 +345,14 @@ def predict_keras_image(image: Image.Image, model: Any) -> dict:
     predicted_idx = max(range(len(probability_map)), key=lambda idx: list(probability_map.values())[idx])
     original_label = list(probability_map.keys())[predicted_idx]
     original_confidence = probability_map[original_label]
-    command, final_category, group, confidence_score, group_scores = classify_group(probability_map)
+    _, _, _, _, group_scores = classify_group(probability_map)
+    command, final_category = map_to_waste_group(original_label)
+    group = label_group(original_label)
+    confidence_score = max(original_confidence, group_scores[group])
 
     return {
         "original_label": original_label,
+        "display_label": display_label(original_label),
         "original_confidence": original_confidence,
         "confidence": confidence_score,
         "command": command,
@@ -363,6 +399,7 @@ def predict_fathima_image(image: Image.Image, model: Any) -> dict:
 
     return {
         "original_label": original_label,
+        "display_label": display_label(original_label),
         "original_confidence": original_confidence,
         "confidence": original_confidence,
         "command": command,
@@ -430,7 +467,18 @@ def send_command_to_esp32(
     print(f"Mo cong serial {port} @ {baudrate} baud...")
     responses = []
     serial_timeout = max(0.05, min(response_wait, 0.2))
-    with serial.Serial(port, baudrate, timeout=serial_timeout) as connection:
+    connection = serial.Serial()
+    connection.port = port
+    connection.baudrate = baudrate
+    connection.timeout = serial_timeout
+    connection.write_timeout = 1
+    connection.dtr = False
+    connection.rts = False
+
+    with connection:
+        # Avoid toggling ESP32 auto-reset lines every time the web app sends a command.
+        connection.setDTR(False)
+        connection.setRTS(False)
         if boot_wait > 0:
             time.sleep(boot_wait)
 
@@ -477,7 +525,7 @@ def print_prediction(result: dict) -> None:
     print("\n" + "=" * 50)
     print(f"PHAN LOAI CUOI CUNG: {result['final_category']}")
     print(
-        f"Nhan model: {result['original_label']} "
+        f"Nhan model: {result.get('display_label', result['original_label'])} / {result['original_label']} "
         f"(do tin cay: {result['confidence']:.2%})"
     )
     print(f"Lenh servo: {result['command']}")
@@ -562,8 +610,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reset-after",
         type=float,
-        default=1.0,
-        help="So giay cho truoc khi gui CENTER. Dat 0 de giu nguyen vi tri.",
+        default=1.5,
+        help="So giay cho truoc khi gui CENTER sau khi quay trai/phai.",
     )
     return parser
 
