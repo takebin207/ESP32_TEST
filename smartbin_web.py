@@ -606,6 +606,25 @@ HTML_PAGE = r"""
       line-height: 1.6;
     }
 
+    .camera-setup-card {
+      display: grid;
+      gap: 12px;
+      margin: 0 18px 18px;
+      padding: 16px;
+      border: 1px solid rgba(34, 211, 238, 0.24);
+      border-radius: 18px;
+      background:
+        radial-gradient(circle at top left, rgba(34,211,238,0.12), transparent 34%),
+        rgba(255,255,255,0.045);
+    }
+
+    .camera-setup-actions {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 10px;
+      align-items: end;
+    }
+
     .settings-grid,
     .controls-grid {
       display: grid;
@@ -1089,8 +1108,18 @@ HTML_PAGE = r"""
             <label>Serial Port
               <input id="portInput" placeholder="COM5">
             </label>
+            <label>Camera Source
+              <select id="cameraSourceInput">
+                <option value="local">Laptop / USB camera</option>
+                <option value="droidcam">DroidCam HTTP over Wi-Fi</option>
+                <option value="phone">Phone / IP camera</option>
+              </select>
+            </label>
             <label>Camera Index
               <input id="cameraIndexInput" type="number" min="0" max="20" step="1" value="0">
+            </label>
+            <label>Phone Camera URL / IP
+              <input id="cameraUrlInput" placeholder="192.168.1.23">
             </label>
             <label>Min Confidence
               <input id="confidenceInput" type="number" min="0" max="1" step="0.05" value="0.35">
@@ -1184,12 +1213,36 @@ HTML_PAGE = r"""
       return {
         model_backend: $("modelBackendInput").value,
         port: $("portInput").value.trim(),
+        camera_source: $("cameraSourceInput").value,
         camera_index: Number($("cameraIndexInput").value),
+        camera_url: $("cameraUrlInput").value.trim(),
         min_confidence: Number($("confidenceInput").value),
         interval: Number($("intervalInput").value),
         cooldown: Number($("cooldownInput").value),
         reset_after: Number($("resetAfterInput").value)
       };
+    }
+
+    function updateCameraInputState() {
+      const source = $("cameraSourceInput").value;
+      const useRemoteCamera = source === "phone" || source === "droidcam";
+      $("cameraIndexInput").disabled = useRemoteCamera;
+      $("cameraUrlInput").disabled = !useRemoteCamera;
+      $("cameraUrlInput").placeholder = source === "droidcam"
+        ? "DroidCam Wi-Fi IP, e.g. 192.168.1.23"
+        : useRemoteCamera
+          ? "http://PHONE_IP:8080/video"
+          : "Only used for phone camera sources";
+    }
+
+    function cameraSettingsReady() {
+      const source = $("cameraSourceInput").value;
+      if ((source === "phone" || source === "droidcam") && !$("cameraUrlInput").value.trim()) {
+        setText("settingsState", "Enter phone IP first");
+        setText("errorText", "Nhap IP/URL camera dien thoai truoc khi chuyen nguon camera.");
+        return false;
+      }
+      return true;
     }
 
     async function sendAction(action) {
@@ -1569,7 +1622,12 @@ HTML_PAGE = r"""
 
       $("runDot").classList.toggle("on", status.detection_enabled);
       setText("runText", status.detection_enabled ? "AI running" : "AI stopped");
-      setText("cameraText", `Camera index ${status.camera_index}`);
+      setText(
+        "cameraText",
+        status.camera_source === "phone" || status.camera_source === "droidcam"
+          ? `${status.camera_source === "droidcam" ? "DroidCam" : "Phone camera"}${status.camera_resolved_url ? ` · ${status.camera_resolved_url}` : ""}`
+          : `Camera index ${status.camera_index}`
+      );
       const modelLabel = status.model_backend || "transformers";
       setText("modelText", status.model_ready ? `${modelLabel} ready` : `${modelLabel} loading`);
       setText("updatedText", status.updated_at || "Waiting");
@@ -1602,7 +1660,10 @@ HTML_PAGE = r"""
 
       if (document.activeElement !== $("portInput")) $("portInput").value = status.serial_port || "";
       if (document.activeElement !== $("modelBackendInput")) $("modelBackendInput").value = status.model_backend || "transformers";
+      if (document.activeElement !== $("cameraSourceInput")) $("cameraSourceInput").value = status.camera_source || "local";
       if (document.activeElement !== $("cameraIndexInput")) $("cameraIndexInput").value = status.camera_index ?? 0;
+      if (document.activeElement !== $("cameraUrlInput")) $("cameraUrlInput").value = status.camera_url || "";
+      updateCameraInputState();
       if (document.activeElement !== $("confidenceInput")) $("confidenceInput").value = status.min_confidence;
       if (document.activeElement !== $("intervalInput")) $("intervalInput").value = status.interval;
       if (document.activeElement !== $("cooldownInput")) $("cooldownInput").value = status.cooldown;
@@ -1630,8 +1691,10 @@ HTML_PAGE = r"""
       if (event.target === $("emptyModal")) closeEmptyModal();
     });
 
-    ["modelBackendInput", "portInput", "cameraIndexInput", "confidenceInput", "intervalInput", "cooldownInput", "resetAfterInput"].forEach((id) => {
+    ["modelBackendInput", "portInput", "cameraSourceInput", "cameraIndexInput", "cameraUrlInput", "confidenceInput", "intervalInput", "cooldownInput", "resetAfterInput"].forEach((id) => {
       $(id).addEventListener("change", async () => {
+        updateCameraInputState();
+        if (!cameraSettingsReady()) return;
         setText("settingsState", "Saving...");
         await postJson("/api/settings", settingsPayload());
         setText("settingsState", "Auto-save");
@@ -1640,6 +1703,7 @@ HTML_PAGE = r"""
     });
 
     renderDashboard();
+    updateCameraInputState();
     refresh();
     setInterval(refresh, 1000);
   </script>
@@ -1650,6 +1714,7 @@ HTML_PAGE = r"""
 
 class SmartBinRuntime:
     MODEL_BACKENDS = {"transformers", "keras", "fathima"}
+    CAMERA_SOURCES = {"local", "phone", "droidcam"}
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -1659,7 +1724,9 @@ class SmartBinRuntime:
         self.model_backend = "transformers"
         self.model_ready = False
         self.model_loading = False
+        self.camera_source = "local"
         self.camera_index = 0
+        self.camera_url = ""
         self.camera_active = True
         self.detection_enabled = True
         self.serial_enabled = True
@@ -1748,41 +1815,61 @@ class SmartBinRuntime:
             return
 
         camera = None
-        open_index = None
+        open_signature = None
 
         while not self.stop_event.is_set():
             with self.lock:
+                camera_source = self.camera_source
                 camera_index = self.camera_index
+                camera_url = self._normalized_camera_url(self.camera_source, self.camera_url)
                 camera_active = self.camera_active
 
             if not camera_active:
                 time.sleep(0.2)
                 continue
 
-            if camera is None or open_index != camera_index:
+            source_signature = (
+                camera_source,
+                camera_url if camera_source in {"phone", "droidcam"} else camera_index,
+            )
+            if camera is None or open_signature != source_signature:
                 if camera is not None:
                     camera.release()
-                logging.info("Opening camera index %s", camera_index)
-                camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+
+                if camera_source in {"phone", "droidcam"}:
+                    if not camera_url:
+                        source_name = "DroidCam" if camera_source == "droidcam" else "Phone camera"
+                        with self.lock:
+                            self.error = f"{source_name} URL is empty. Example: http://PHONE_IP:4747/video"
+                        time.sleep(1)
+                        continue
+                    logging.info("Opening %s camera URL %s", camera_source, camera_url)
+                    camera = cv2.VideoCapture(camera_url)
+                else:
+                    logging.info("Opening camera index %s", camera_index)
+                    camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+
                 camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 camera.set(cv2.CAP_PROP_FPS, 30)
                 camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                open_index = camera_index
+                open_signature = source_signature
                 time.sleep(0.4)
 
             if not camera.isOpened():
-                logging.error("Camera %s is not available", camera_index)
+                source_label = camera_url if camera_source in {"phone", "droidcam"} else f"index {camera_index}"
+                logging.error("Camera %s is not available", source_label)
                 with self.lock:
-                    self.error = f"Camera {camera_index} is not available"
+                    self.error = f"Camera {source_label} is not available"
                 time.sleep(1)
                 continue
 
             ok, frame = camera.read()
             if not ok:
-                logging.error("Could not read camera frame")
+                source_label = camera_url if camera_source in {"phone", "droidcam"} else f"index {camera_index}"
+                logging.error("Could not read camera frame from %s", source_label)
                 with self.lock:
-                    self.error = "Could not read camera frame"
+                    self.error = f"Could not read camera frame from {source_label}"
                 time.sleep(0.5)
                 continue
 
@@ -1976,6 +2063,30 @@ class SmartBinRuntime:
             self.last_serial_response = " | ".join(responses) if responses else "No response from ESP32"
             self.error = ""
 
+    @staticmethod
+    def _normalized_camera_url(camera_source: str, camera_url: str) -> str:
+        raw_url = str(camera_url or "").strip()
+        if not raw_url:
+            return ""
+
+        if camera_source == "droidcam":
+            if raw_url.startswith(("http://", "https://", "rtsp://")):
+                normalized = raw_url
+            else:
+                host = raw_url.strip("/")
+                if ":" not in host:
+                    host = f"{host}:4747"
+                normalized = f"http://{host}"
+
+            lowered = normalized.lower().rstrip("/")
+            if lowered.startswith(("http://", "https://")) and not lowered.endswith(("/video", "/mjpegfeed")):
+                normalized = f"{normalized.rstrip('/')}/video"
+            return normalized
+
+        if raw_url.startswith(("http://", "https://", "rtsp://")):
+            return raw_url
+        return f"http://{raw_url}"
+
     def update_settings(self, data: dict[str, Any]) -> None:
         requested_backend = data.get("model_backend")
         if requested_backend is not None:
@@ -1983,7 +2094,19 @@ class SmartBinRuntime:
 
         with self.lock:
             port = str(data.get("port") or "").strip()
+            camera_source = str(data.get("camera_source") or self.camera_source).strip().lower()
+            if camera_source not in self.CAMERA_SOURCES:
+                camera_source = "local"
+            camera_url = str(data.get("camera_url") or "").strip()
+
+            if camera_source in {"phone", "droidcam"} and not camera_url:
+                self.error = "Nhap IP/URL camera dien thoai truoc khi chuyen sang nguon camera dien thoai."
+                camera_source = self.camera_source
+                camera_url = self.camera_url
+
             self.serial_port = port or auto_detect_port()
+            self.camera_source = camera_source
+            self.camera_url = camera_url
             self.min_confidence = self._number(data.get("min_confidence"), self.min_confidence, 0, 1)
             self.interval = self._number(data.get("interval"), self.interval, 0.5, 30)
             self.cooldown = self._number(data.get("cooldown"), self.cooldown, 0, 60)
@@ -2074,7 +2197,10 @@ class SmartBinRuntime:
                 "model_loading": self.model_loading,
                 "model_backend": self.model_backend,
                 "camera_active": self.camera_active,
+                "camera_source": self.camera_source,
                 "camera_index": self.camera_index,
+                "camera_url": self.camera_url,
+                "camera_resolved_url": self._normalized_camera_url(self.camera_source, self.camera_url),
                 "detection_enabled": self.detection_enabled,
                 "serial_enabled": serial_enabled,
                 "serial_port": serial_port,
@@ -2191,7 +2317,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local SmartBin web dashboard.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5000)
+    parser.add_argument("--camera-source", choices=["local", "phone", "droidcam"], default="local")
     parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--camera-url", default="")
     parser.add_argument("--serial-port", default=None)
     parser.add_argument("--no-serial", action="store_true")
     parser.add_argument(
@@ -2206,15 +2334,19 @@ def main() -> None:
     setup_logging()
     args = build_parser().parse_args()
     logging.info(
-        "Starting Flask server host=%s port=%s camera_index=%s serial_port=%s serial_enabled=%s",
+        "Starting Flask server host=%s port=%s camera_source=%s camera_index=%s camera_url=%s serial_port=%s serial_enabled=%s",
         args.host,
         args.port,
+        args.camera_source,
         args.camera_index,
+        args.camera_url,
         args.serial_port,
         not args.no_serial,
     )
     runtime.model_backend = args.model_backend
+    runtime.camera_source = args.camera_source
     runtime.camera_index = args.camera_index
+    runtime.camera_url = args.camera_url
     runtime.serial_enabled = not args.no_serial
     runtime.serial_port = args.serial_port or runtime.serial_port
     runtime.start()
