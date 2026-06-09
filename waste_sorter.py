@@ -268,7 +268,7 @@ def capture_camera_frame(camera_index: int, warmup_frames: int) -> Image.Image:
     if cv2 is None:
         raise RuntimeError("Chua cai opencv-python. Cai bang lenh: python -m pip install -r requirements.txt")
 
-    camera = cv2.VideoCapture(camera_index, cv2.CAP_DSHOW)
+    camera = cv2.VideoCapture(camera_index)
     if not camera.isOpened():
         raise RuntimeError(f"Khong mo duoc camera laptop index {camera_index}.")
 
@@ -285,6 +285,7 @@ def capture_camera_frame(camera_index: int, warmup_frames: int) -> Image.Image:
 
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         return Image.fromarray(rgb_frame)
+
     finally:
         camera.release()
 
@@ -297,12 +298,16 @@ def predict_image(image: Image.Image, processor: Any, model: Any) -> dict:
         logits = outputs.logits
 
     probabilities = torch.nn.functional.softmax(logits, dim=-1)[0]
-    predicted_class_idx = logits.argmax(-1).item()
 
     labels = model.config.id2label
     probability_map = {labels[idx]: score.item() for idx, score in enumerate(probabilities)}
-    original_label = labels[predicted_class_idx]
-    original_confidence = probabilities[predicted_class_idx].item()
+    
+    # An (hide) phan loai bia carton de tranh nham lan voi background
+    if "cardboard" in probability_map:
+        probability_map["cardboard"] = 0.0
+
+    original_label = max(probability_map, key=probability_map.get)
+    original_confidence = probability_map[original_label]
     _, _, _, _, group_scores = classify_group(probability_map)
     command, final_category = map_to_waste_group(original_label)
     group = label_group(original_label)
@@ -342,8 +347,12 @@ def predict_keras_image(image: Image.Image, model: Any) -> dict:
         KERAS_LABELS[idx]: float(probabilities[idx])
         for idx in range(min(len(KERAS_LABELS), len(probabilities)))
     }
-    predicted_idx = max(range(len(probability_map)), key=lambda idx: list(probability_map.values())[idx])
-    original_label = list(probability_map.keys())[predicted_idx]
+    
+    # An (hide) phan loai bia carton de tranh nham lan voi background
+    if "cardboard" in probability_map:
+        probability_map["cardboard"] = 0.0
+
+    original_label = max(probability_map, key=probability_map.get)
     original_confidence = probability_map[original_label]
     _, _, _, _, group_scores = classify_group(probability_map)
     command, final_category = map_to_waste_group(original_label)
@@ -409,8 +418,58 @@ def predict_fathima_image(image: Image.Image, model: Any) -> dict:
         "probabilities": probability_map,
     }
 
+def is_blank_image(image: Image.Image) -> bool:
+    import numpy as np
+    import logging
+
+    if not hasattr(is_blank_image, "reference_bg"):
+        is_blank_image.reference_bg = None
+
+    gray = np.array(image.convert("L"), dtype=np.float32)
+
+    if is_blank_image.reference_bg is None:
+        is_blank_image.reference_bg = gray
+        logging.info("Set initial frame as reference background.")
+        return True
+
+    # Compensate for global brightness changes (auto-exposure)
+    diff_raw = gray - is_blank_image.reference_bg
+    median_shift = np.median(diff_raw)
+    
+    diff_abs = np.abs(diff_raw - median_shift)
+    changed_pixels = np.sum(diff_abs > 35) # threshold for local changes
+    changed_ratio = changed_pixels / gray.size
+
+    # Compute edge density as a secondary check
+    if cv2 is not None:
+        edges = cv2.Canny(np.array(image.convert("L")), 30, 100)
+        edge_density = np.sum(edges > 0) / edges.size
+    else:
+        edge_density = 1.0
+
+    if changed_ratio < 0.04 or edge_density < 0.015:
+        # Update background
+        is_blank_image.reference_bg = 0.9 * is_blank_image.reference_bg + 0.1 * gray
+        return True
+
+    logging.info(f"Image not blank. changed_ratio={changed_ratio:.4f}, edge_density={edge_density:.4f}")
+    return False
+
 
 def predict_with_backend(image: Image.Image, backend: str, processor: Any, model: Any) -> dict:
+    if is_blank_image(image):
+        return {
+            "original_label": "nothing",
+            "display_label": "Khong co rac",
+            "original_confidence": 1.0,
+            "confidence": 1.0,
+            "command": "CENTER",
+            "group": "nothing",
+            "final_category": "TRONG - Khong phat hien rac",
+            "group_scores": {"organic": 0.0, "inorganic": 0.0, "hazardous": 0.0, "nothing": 1.0},
+            "probabilities": {"nothing": 1.0},
+        }
+
     if backend == "fathima":
         return predict_fathima_image(image, model)
 
@@ -546,7 +605,7 @@ def run_live_camera(args: argparse.Namespace, backend: str, processor: Any, mode
         raise RuntimeError("Chua cai opencv-python. Cai bang lenh: python -m pip install -r requirements.txt")
 
     port = None if args.no_serial else resolve_port(args.port)
-    camera = cv2.VideoCapture(args.camera_index, cv2.CAP_DSHOW)
+    camera = cv2.VideoCapture(args.camera_index)
     if not camera.isOpened():
         raise RuntimeError(f"Khong mo duoc camera laptop index {args.camera_index}.")
 

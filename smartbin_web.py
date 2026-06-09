@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import socket
 import threading
 import time
 from collections import deque
@@ -8,6 +9,7 @@ from datetime import datetime
 from typing import Any
 
 from flask import Flask, Response, jsonify, render_template_string, request
+import numpy as np
 from PIL import Image
 
 from waste_sorter import (
@@ -312,7 +314,7 @@ HTML_PAGE = r"""
 
     .camera-wrap {
       position: relative;
-      aspect-ratio: 16 / 9;
+      aspect-ratio: 1 / 1;
       background: #030712;
       border-bottom: 1px solid var(--border);
     }
@@ -900,6 +902,7 @@ HTML_PAGE = r"""
       .hero-grid,
       .bin-grid,
       .settings-grid,
+      .camera-setup-actions,
       .controls-grid,
       .small-stat-grid {
         grid-template-columns: 1fr;
@@ -1097,6 +1100,22 @@ HTML_PAGE = r"""
             </div>
             <div class="connection-meta" id="servoStatusMeta">Waiting for ESP32 diagnostic response</div>
           </div>
+          <div class="camera-setup-card">
+            <div class="connection-row">
+              <span class="dot on"></span>
+              <span>DroidCam Wi-Fi Setup</span>
+            </div>
+            <div class="connection-meta">
+              Nhap IP hien tren app DroidCam dien thoai. Khong can mo DroidCam desktop client neu no lam may tinh sap nguon.
+            </div>
+            <div class="camera-setup-actions">
+              <label>DroidCam IP / URL
+                <input id="droidCamQuickInput" placeholder="192.168.1.23 hoac 192.168.1.23:4747">
+              </label>
+              <button class="btn steel" id="applyDroidCamBtn" type="button">Use DroidCam</button>
+            </div>
+            <div class="connection-meta" id="droidCamResolvedText">Resolved URL: waiting</div>
+          </div>
           <div class="settings-grid">
             <label>Model Backend
               <select id="modelBackendInput">
@@ -1111,12 +1130,14 @@ HTML_PAGE = r"""
             <label>Camera Source
               <select id="cameraSourceInput">
                 <option value="local">Laptop / USB camera</option>
+                <option value="phone_web">Phone browser /cam</option>
                 <option value="droidcam">DroidCam HTTP over Wi-Fi</option>
+                <option value="ivcam" selected>iVCam (PC Client / Virtual Camera)</option>
                 <option value="phone">Phone / IP camera</option>
               </select>
             </label>
             <label>Camera Index
-              <input id="cameraIndexInput" type="number" min="0" max="20" step="1" value="0">
+              <input id="cameraIndexInput" type="number" min="0" max="20" step="1" value="1">
             </label>
             <label>Phone Camera URL / IP
               <input id="cameraUrlInput" placeholder="192.168.1.23">
@@ -1226,13 +1247,33 @@ HTML_PAGE = r"""
     function updateCameraInputState() {
       const source = $("cameraSourceInput").value;
       const useRemoteCamera = source === "phone" || source === "droidcam";
-      $("cameraIndexInput").disabled = useRemoteCamera;
-      $("cameraUrlInput").disabled = !useRemoteCamera;
+      const usePhoneWeb = source === "phone_web";
+      $("cameraIndexInput").disabled = useRemoteCamera || usePhoneWeb;
+      $("cameraUrlInput").disabled = false;
       $("cameraUrlInput").placeholder = source === "droidcam"
         ? "DroidCam Wi-Fi IP, e.g. 192.168.1.23"
-        : useRemoteCamera
+        : source === "ivcam"
+          ? "Khong can IP. Doi Index o tren."
+          : usePhoneWeb
+          ? "Not needed. Open /cam on phone."
+          : useRemoteCamera
           ? "http://PHONE_IP:8080/video"
-          : "Only used for phone camera sources";
+          : "Optional. Use the DroidCam setup box above for phone camera.";
+    }
+
+    function syncDroidCamQuickInput(status = null) {
+      const quickInput = $("droidCamQuickInput");
+      if (quickInput && document.activeElement !== quickInput) {
+        quickInput.value = $("cameraUrlInput").value || "";
+      }
+      const resolved = status?.camera_resolved_url;
+      const source = status?.camera_source || $("cameraSourceInput").value;
+      setText(
+        "droidCamResolvedText",
+        source === "droidcam"
+          ? `Resolved URL: ${resolved || "waiting for IP"}`
+          : "URL format: http://PHONE_IP:4747/video"
+      );
     }
 
     function cameraSettingsReady() {
@@ -1624,8 +1665,12 @@ HTML_PAGE = r"""
       setText("runText", status.detection_enabled ? "AI running" : "AI stopped");
       setText(
         "cameraText",
-        status.camera_source === "phone" || status.camera_source === "droidcam"
-          ? `${status.camera_source === "droidcam" ? "DroidCam" : "Phone camera"}${status.camera_resolved_url ? ` · ${status.camera_resolved_url}` : ""}`
+        status.camera_source === "phone_web"
+          ? `Phone /cam${status.phone_frame_age != null ? ` Â· last frame ${status.phone_frame_age.toFixed(1)}s ago` : ""}`
+          : status.camera_source === "phone" || status.camera_source === "droidcam"
+          ? `${status.camera_source === "droidcam" ? "DroidCam" : "Phone camera"}${status.camera_resolved_url ? ` Â· ${status.camera_resolved_url}` : ""}`
+          : status.camera_source === "ivcam"
+          ? `iVCam (Index ${status.camera_index})`
           : `Camera index ${status.camera_index}`
       );
       const modelLabel = status.model_backend || "transformers";
@@ -1664,6 +1709,7 @@ HTML_PAGE = r"""
       if (document.activeElement !== $("cameraIndexInput")) $("cameraIndexInput").value = status.camera_index ?? 0;
       if (document.activeElement !== $("cameraUrlInput")) $("cameraUrlInput").value = status.camera_url || "";
       updateCameraInputState();
+      syncDroidCamQuickInput(status);
       if (document.activeElement !== $("confidenceInput")) $("confidenceInput").value = status.min_confidence;
       if (document.activeElement !== $("intervalInput")) $("intervalInput").value = status.interval;
       if (document.activeElement !== $("cooldownInput")) $("cooldownInput").value = status.cooldown;
@@ -1691,9 +1737,36 @@ HTML_PAGE = r"""
       if (event.target === $("emptyModal")) closeEmptyModal();
     });
 
+    async function applyDroidCamQuickSettings() {
+      const value = $("droidCamQuickInput").value.trim();
+      if (!value) {
+        setText("settingsState", "Enter DroidCam IP first");
+        setText("errorText", "Nhap IP DroidCam tren dien thoai, vi du 192.168.1.23 hoac 192.168.1.23:4747.");
+        return;
+      }
+      $("cameraSourceInput").value = "droidcam";
+      $("cameraUrlInput").value = value;
+      updateCameraInputState();
+      setText("settingsState", "Saving DroidCam...");
+      const response = await postJson("/api/settings", settingsPayload());
+      if (response.ok === false) {
+        setText("settingsState", "DroidCam error");
+        setText("errorText", response.error || "Khong doi duoc sang DroidCam.");
+        return;
+      }
+      setText("settingsState", "DroidCam enabled");
+      await refresh();
+    }
+
+    $("applyDroidCamBtn").addEventListener("click", applyDroidCamQuickSettings);
+    $("droidCamQuickInput").addEventListener("keydown", (event) => {
+      if (event.key === "Enter") applyDroidCamQuickSettings();
+    });
+
     ["modelBackendInput", "portInput", "cameraSourceInput", "cameraIndexInput", "cameraUrlInput", "confidenceInput", "intervalInput", "cooldownInput", "resetAfterInput"].forEach((id) => {
       $(id).addEventListener("change", async () => {
         updateCameraInputState();
+        syncDroidCamQuickInput();
         if (!cameraSettingsReady()) return;
         setText("settingsState", "Saving...");
         await postJson("/api/settings", settingsPayload());
@@ -1704,8 +1777,237 @@ HTML_PAGE = r"""
 
     renderDashboard();
     updateCameraInputState();
+    syncDroidCamQuickInput();
     refresh();
     setInterval(refresh, 1000);
+  </script>
+</body>
+</html>
+"""
+
+CAM_PAGE = r"""
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SmartBin Phone Camera</title>
+  <style>
+    :root {
+      --bg: #09090b;
+      --card: rgba(24,24,27,0.82);
+      --border: rgba(255,255,255,0.12);
+      --text: #fafafa;
+      --muted: #a1a1aa;
+      --green: #22c55e;
+      --red: #ef4444;
+      --blue: #38bdf8;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background:
+        radial-gradient(circle at 20% 0%, rgba(56,189,248,0.18), transparent 34%),
+        radial-gradient(circle at 80% 100%, rgba(34,197,94,0.16), transparent 34%),
+        var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      padding: 18px;
+    }
+
+    .wrap {
+      max-width: 720px;
+      margin: 0 auto;
+      display: grid;
+      gap: 16px;
+    }
+
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 24px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.08), rgba(255,255,255,0.03)), var(--card);
+      box-shadow: 0 26px 80px rgba(0,0,0,0.44);
+      overflow: hidden;
+    }
+
+    .head {
+      padding: 20px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(30px, 8vw, 56px);
+      line-height: 0.95;
+      letter-spacing: -0.06em;
+    }
+
+    p {
+      color: var(--muted);
+      line-height: 1.6;
+      margin: 10px 0 0;
+    }
+
+    video {
+      width: 100%;
+      display: block;
+      aspect-ratio: 1 / 1;
+      background: #000;
+      object-fit: cover;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 10px;
+      padding: 16px;
+    }
+
+    button {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      color: var(--text);
+      background: rgba(255,255,255,0.06);
+      padding: 14px 16px;
+      font-size: 16px;
+      font-weight: 800;
+    }
+
+    button.primary {
+      background: linear-gradient(135deg, #16a34a, #22c55e);
+      color: #052e16;
+    }
+
+    button.danger {
+      background: rgba(239,68,68,0.16);
+      color: #fecaca;
+      border-color: rgba(239,68,68,0.34);
+    }
+
+    .status {
+      margin: 0 16px 16px;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.04);
+      color: var(--muted);
+      line-height: 1.5;
+    }
+
+    .dot {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 99px;
+      background: var(--red);
+      margin-right: 8px;
+    }
+
+    .dot.on {
+      background: var(--green);
+      box-shadow: 0 0 0 7px rgba(34,197,94,0.14);
+    }
+
+    canvas { display: none; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="head">
+      <h1>SmartBin Phone Camera</h1>
+      <p>Keep this page open. The phone camera will be sent to the SmartBin dashboard as the AI camera source.</p>
+    </section>
+
+    <section class="card">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="canvas"></canvas>
+      <div class="controls">
+        <button class="primary" id="startBtn">Start Camera</button>
+        <button class="danger" id="stopBtn">Stop</button>
+      </div>
+      <div class="status" id="status"><span class="dot" id="dot"></span>Waiting. Tap Start Camera.</div>
+    </section>
+  </main>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("canvas");
+    const statusBox = document.getElementById("status");
+    const dot = document.getElementById("dot");
+    let stream = null;
+    let sendTimer = null;
+    let inFlight = false;
+    let sentFrames = 0;
+
+    function setStatus(message, online = false) {
+      dot.classList.toggle("on", online);
+      statusBox.innerHTML = `<span class="dot ${online ? "on" : ""}" id="dotInline"></span>${message}`;
+    }
+
+    async function enablePhoneSource() {
+      await fetch("/api/phone_camera/start", { method: "POST" });
+    }
+
+    async function sendFrame() {
+      if (!stream || inFlight || video.readyState < 2) return;
+      inFlight = true;
+      try {
+        const width = Math.min(640, video.videoWidth || 640);
+        const height = Math.round(width * ((video.videoHeight || 480) / (video.videoWidth || 640)));
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext("2d", { alpha: false });
+        ctx.drawImage(video, 0, 0, width, height);
+        const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.68));
+        if (!blob) return;
+        const form = new FormData();
+        form.append("frame", blob, "phone.jpg");
+        const response = await fetch("/api/phone_frame", { method: "POST", body: form });
+        const data = await response.json();
+        sentFrames += 1;
+        setStatus(data.ok ? `Streaming to SmartBin. Sent frames: ${sentFrames}` : (data.error || "Frame rejected"), data.ok);
+      } catch (error) {
+        setStatus(`Upload error: ${error.message}`, false);
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    async function startCamera() {
+      try {
+        await enablePhoneSource();
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: "environment" },
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+        video.srcObject = stream;
+        clearInterval(sendTimer);
+        sendTimer = setInterval(sendFrame, 160);
+        setStatus("Camera started. Sending frames...", true);
+      } catch (error) {
+        setStatus(`Camera error: ${error.message}. If permission is blocked, use HTTPS or a browser that allows camera on local network.`, false);
+      }
+    }
+
+    function stopCamera() {
+      clearInterval(sendTimer);
+      sendTimer = null;
+      if (stream) {
+        stream.getTracks().forEach((track) => track.stop());
+        stream = null;
+      }
+      video.srcObject = null;
+      setStatus("Stopped.", false);
+    }
+
+    document.getElementById("startBtn").addEventListener("click", startCamera);
+    document.getElementById("stopBtn").addEventListener("click", stopCamera);
   </script>
 </body>
 </html>
@@ -1714,7 +2016,7 @@ HTML_PAGE = r"""
 
 class SmartBinRuntime:
     MODEL_BACKENDS = {"transformers", "keras", "fathima"}
-    CAMERA_SOURCES = {"local", "phone", "droidcam"}
+    CAMERA_SOURCES = {"local", "phone", "droidcam", "ivcam", "phone_web"}
 
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -1724,8 +2026,8 @@ class SmartBinRuntime:
         self.model_backend = "transformers"
         self.model_ready = False
         self.model_loading = False
-        self.camera_source = "local"
-        self.camera_index = 0
+        self.camera_source = "ivcam"
+        self.camera_index = 1
         self.camera_url = ""
         self.camera_active = True
         self.detection_enabled = True
@@ -1756,6 +2058,8 @@ class SmartBinRuntime:
         self.history: deque[dict[str, Any]] = deque(maxlen=120)
         self.frame_jpeg: bytes | None = None
         self.latest_frame: Any = None
+        self.phone_frame_received_at = 0.0
+        self.phone_frame_count = 0
         self.stop_event = threading.Event()
 
     def start(self) -> None:
@@ -1828,6 +2132,20 @@ class SmartBinRuntime:
                 time.sleep(0.2)
                 continue
 
+            if camera_source == "phone_web":
+                if camera is not None:
+                    camera.release()
+                    camera = None
+                open_signature = ("phone_web", "upload")
+                with self.lock:
+                    frame_age = time.monotonic() - self.phone_frame_received_at if self.phone_frame_received_at else None
+                    if not self.phone_frame_received_at:
+                        self.error = "Waiting for phone camera. Open /cam on your phone and tap Start Camera."
+                    elif frame_age is not None and frame_age > 3:
+                        self.error = f"Phone camera stream is stale ({frame_age:.1f}s). Keep /cam open on the phone."
+                time.sleep(0.2)
+                continue
+
             source_signature = (
                 camera_source,
                 camera_url if camera_source in {"phone", "droidcam"} else camera_index,
@@ -1873,6 +2191,7 @@ class SmartBinRuntime:
                 time.sleep(0.5)
                 continue
 
+            frame = self._crop_square(frame)
             self._update_frame(frame)
             with self.lock:
                 self.latest_frame = frame.copy()
@@ -1880,6 +2199,15 @@ class SmartBinRuntime:
 
         if camera is not None:
             camera.release()
+
+    def _crop_square(self, frame: Any) -> Any:
+        h, w = frame.shape[:2]
+        if h == w:
+            return frame
+        min_dim = min(h, w)
+        start_y = (h - min_dim) // 2
+        start_x = (w - min_dim) // 2
+        return frame[start_y:start_y+min_dim, start_x:start_x+min_dim]
 
     def _update_frame(self, frame: Any) -> None:
         preview = frame.copy()
@@ -1902,6 +2230,23 @@ class SmartBinRuntime:
         if ok:
             with self.lock:
                 self.frame_jpeg = encoded.tobytes()
+
+    def update_phone_frame(self, image_bytes: bytes) -> None:
+        if cv2 is None:
+            raise RuntimeError("opencv-python is missing")
+
+        array = np.frombuffer(image_bytes, dtype=np.uint8)
+        frame = cv2.imdecode(array, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise RuntimeError("Invalid phone camera frame")
+
+        frame = self._crop_square(frame)
+        self._update_frame(frame)
+        with self.lock:
+            self.latest_frame = frame.copy()
+            self.phone_frame_received_at = time.monotonic()
+            self.phone_frame_count += 1
+            self.error = ""
 
     def _detection_loop(self) -> None:
         while not self.stop_event.is_set():
@@ -2201,6 +2546,12 @@ class SmartBinRuntime:
                 "camera_index": self.camera_index,
                 "camera_url": self.camera_url,
                 "camera_resolved_url": self._normalized_camera_url(self.camera_source, self.camera_url),
+                "phone_frame_count": self.phone_frame_count,
+                "phone_frame_age": (
+                    time.monotonic() - self.phone_frame_received_at
+                    if self.phone_frame_received_at
+                    else None
+                ),
                 "detection_enabled": self.detection_enabled,
                 "serial_enabled": serial_enabled,
                 "serial_port": serial_port,
@@ -2252,6 +2603,11 @@ def index() -> str:
     return render_template_string(HTML_PAGE)
 
 
+@app.get("/cam")
+def phone_camera_page() -> str:
+    return render_template_string(CAM_PAGE)
+
+
 @app.get("/video_feed")
 def video_feed() -> Response:
     return Response(frame_stream(), mimetype="multipart/x-mixed-replace; boundary=frame")
@@ -2279,6 +2635,31 @@ def api_settings() -> Response:
     return jsonify(runtime.status())
 
 
+@app.post("/api/phone_camera/start")
+def api_phone_camera_start() -> Response:
+    with runtime.lock:
+        runtime.camera_source = "phone_web"
+        runtime.camera_active = True
+        runtime.error = "Waiting for phone camera frame..."
+    return jsonify(runtime.status())
+
+
+@app.post("/api/phone_frame")
+def api_phone_frame() -> Response:
+    uploaded = request.files.get("frame")
+    if uploaded is None:
+        return jsonify({"ok": False, "error": "Missing frame file"}), 400
+
+    try:
+        runtime.update_phone_frame(uploaded.read())
+    except Exception as exc:
+        with runtime.lock:
+            runtime.error = str(exc)
+        return jsonify({"ok": False, "error": str(exc)}), 400
+
+    return jsonify({"ok": True, "frame_count": runtime.phone_frame_count})
+
+
 @app.post("/api/control")
 def api_control() -> Response:
     data = request.get_json(silent=True) or {}
@@ -2293,6 +2674,7 @@ def api_control() -> Response:
         elif action == "stop":
             with runtime.lock:
                 runtime.detection_enabled = False
+                runtime.last_result = None
         elif action == "reset_stats":
             runtime.reset_stats()
         elif action == "center":
@@ -2317,11 +2699,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Local SmartBin web dashboard.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5000)
-    parser.add_argument("--camera-source", choices=["local", "phone", "droidcam"], default="local")
-    parser.add_argument("--camera-index", type=int, default=0)
+    parser.add_argument("--camera-source", choices=["local", "phone", "droidcam", "ivcam", "phone_web"], default="ivcam")
+    parser.add_argument("--camera-index", type=int, default=1)
     parser.add_argument("--camera-url", default="")
     parser.add_argument("--serial-port", default=None)
     parser.add_argument("--no-serial", action="store_true")
+    parser.add_argument("--ssl", action="store_true", help="Run Flask with a temporary HTTPS certificate.")
     parser.add_argument(
         "--model-backend",
         choices=["transformers", "keras", "fathima"],
@@ -2350,7 +2733,8 @@ def main() -> None:
     runtime.serial_enabled = not args.no_serial
     runtime.serial_port = args.serial_port or runtime.serial_port
     runtime.start()
-    app.run(host=args.host, port=args.port, debug=False, threaded=True)
+    ssl_context = "adhoc" if args.ssl else None
+    app.run(host=args.host, port=args.port, debug=False, threaded=True, ssl_context=ssl_context)
 
 
 if __name__ == "__main__":
